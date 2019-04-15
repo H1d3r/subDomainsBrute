@@ -1,43 +1,50 @@
-# subDomainsBrute
+subDomainsBrute 1.1
+======
 
-A simple and fast sub domain brute tool for pentesters.
+A fast sub domain brute tool for pentesters.
 
-这个脚本的主要目标是发现其他工具无法探测到的域名. 比如大家常用的Google，aizhan，fofa。
+本工具用于渗透测试目标域名收集。高并发DNS暴力枚举，发现其他工具无法探测到的域名, 如Google，aizhan，fofa。
 
-##Change Log
-* 字典统一到dict文件夹下
-* 精简二级域名字典，丰富三四域名字典
-* 增加-i参数，忽略指向内网IP域名
-* 默认由10线程调整为30线程，但增加了超时重试
+You can get older versions via [https://github.com/lijiejie/subDomainsBrute/releases](https://github.com/lijiejie/subDomainsBrute/releases)
 
-##Dependencies
-First you need to install [dnspython](http://www.dnspython.org/kits/1.12.0/) to do DNS query
-> pip install dnspython
 
-## Improvements
-* 用小字典递归地发现三级域名，四级域名、五级域名等不容易被探测到的域名
-* 字典较为丰富，小字典就包括1万5千条，大字典多达6万3千条
-* 默认使用114DNS、百度DNS、阿里DNS这几个快速又可靠的Public DNS查询，可修改配置文件添加DNS服务器
-* 自动去重泛解析的域名，当前规则： 超过2个域名指向同一IP，则此后发现的其他指向该IP的域名将被丢弃
-* 速度尚可，在我的PC上，每秒稳定扫描约3百个域名（30个线程）
+## Change Log 
+* [2018-02-06] 
+	* 添加多进程支持。 多进程 + 协程，提升扫描效率。 
+	* 预处理了原字典中的占位符，提升扫描效率
+* [2017-06-03] Bug fix: normal_lines remove deep copy issus, thanks @BlueIce
+* [2017-05-04] 使用协程替代多线程； 使用了优化级队列，来减小队列的长度； 优化占位符支持
 
-##Usage
-```
-Usage: subDomainsBrute.py [options] target.com
 
-Options:
-  -h, --help            show this help message and exit
-  -t THREADS_NUM, --threads=THREADS_NUM
-                        Number of threads. default = 30
-  -f NAMES_FILE, --file=NAMES_FILE
-                        Dict file used to brute sub names
-  -i, --ignore-intranet
-                        Ignore domains pointed to private IPs.
-  -o OUTPUT, --output=OUTPUT
-                        Output file name. default is {target}.txt
+## Dependencies ##
+> pip install dnspython gevent
 
-```
 
-Output file could be like: [http://www.lijiejie.com/wp-content/uploads/2015/04/baidu.com_.txt](http://www.lijiejie.com/wp-content/uploads/2015/04/baidu.com_.txt)
+## Usage ##
+	Usage: subDomainsBrute.py [options] target.com
+	Options:
+	  --version             show program's version number and exit
+	  -h, --help            show this help message and exit
+	  -f FILE               File contains new line delimited subs, default is
+	                        subnames.txt.
+	  --full                Full scan, NAMES FILE subnames_full.txt will be used
+	                        to brute
+	  -i, --ignore-intranet
+	                        Ignore domains pointed to private IPs
+	  -t THREADS, --threads=THREADS
+	                        Num of scan threads, 200 by default
+	  -p PROCESS, --process=PROCESS
+	                        Num of scan Process, 6 by default
+	  -o OUTPUT, --output=OUTPUT
+	                        Output file name. default is {target}.txt
 
-my[at]lijiejie.com ([http://www.lijiejie.com](http://www.lijiejie.com))
+
+## Screenshot ##
+
+如图，使用默认字典，扫描qq.com，发现去重后域名2319个，耗时约298秒。
+
+![screenshot](screenshot.png)
+
+Output could be like: [https://github.com/lijiejie/subDomainsBrute/blob/master/dict/sample_qq.com.txt](https://github.com/lijiejie/subDomainsBrute/blob/master/dict/sample_qq.com.txt)
+
+From [http://www.lijiejie.com](http://www.lijiejie.com)

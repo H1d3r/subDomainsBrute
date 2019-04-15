@@ -1,176 +1,279 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
-# A simple and fast sub domains brute tool for pentesters
-# my[at]lijiejie.com (http://www.lijiejie.com)
+"""
+    subDomainsBrute 1.1
+    A simple and fast sub domains brute tool for pentesters
+    my[at]lijiejie.com (http://www.lijiejie.com)
+"""
 
-import Queue
-import sys
+import multiprocessing
+import gevent
+from gevent import monkey
+monkey.patch_all()
+from gevent.queue import PriorityQueue
+import re
 import dns.resolver
-import threading
 import time
-import optparse
+import signal
 import os
-from lib.consle_width import getTerminalSize
+import glob
+from lib.cmdline import parse_args
+from lib.common import is_intranet, load_dns_servers, load_next_sub, print_msg, get_out_file_name, \
+    user_abort
 
 
-class DNSBrute:
-    def __init__(self, target, names_file, ignore_intranet, threads_num, output):
+class SubNameBrute:
+    def __init__(self, target, options, process_num, dns_servers, next_subs,
+                 scan_count, found_count, queue_size_list, tmp_dir):
         self.target = target.strip()
-        self.names_file = names_file
-        self.ignore_intranet = ignore_intranet
-        self.thread_count = self.threads_num = threads_num
-        self.scan_count = self.found_count = 0
-        self.lock = threading.Lock()
-        self.console_width = getTerminalSize()[0] - 2    # Cal terminal width when starts up
-        self.resolvers = [dns.resolver.Resolver() for _ in range(threads_num)]
-        self._load_dns_servers()
-        self._load_sub_names()
-        self._load_next_sub()
-        outfile = target + '.txt' if not output else output
-        self.outfile = open(outfile, 'w')   # won't close manually
-        self.ip_dict = {}
-        self.STOP_ME = False
-
-    def _load_dns_servers(self):
-        dns_servers = []
-        with open('dict/dns_servers.txt') as f:
-            for line in f:
-                server = line.strip()
-                if server.count('.') == 3 and server not in dns_servers:
-                    dns_servers.append(server)
+        self.options = options
+        self.process_num = process_num
         self.dns_servers = dns_servers
         self.dns_count = len(dns_servers)
+        self.next_subs = next_subs
+        self.scan_count = scan_count
+        self.scan_count_local = 0
+        self.found_count = found_count
+        self.found_count_local = 0
+        self.queue_size_list = queue_size_list
+
+        self.resolvers = [dns.resolver.Resolver(configure=False) for _ in range(options.threads)]
+        for _r in self.resolvers:
+            _r.lifetime = _r.timeout = 6.0
+        self.queue = PriorityQueue()
+        self.item_index = 0
+        self.priority = 0
+        self._load_sub_names()
+        self.ip_dict = {}
+        self.found_subs = set()
+        self.ex_resolver = dns.resolver.Resolver(configure=False)
+        self.ex_resolver.nameservers = dns_servers
+        self.local_time = time.time()
+        self.outfile = open('%s/%s_part_%s.txt' % (tmp_dir, target, process_num), 'w')
 
     def _load_sub_names(self):
-        self.queue = Queue.Queue()
-        file = 'dict/' + self.names_file if not os.path.exists(self.names_file) else self.names_file
-        with open(file) as f:
-            for line in f:
+        if self.options.full_scan and self.options.file == 'subnames.txt':
+            _file = 'dict/subnames_full.txt'
+        else:
+            if os.path.exists(self.options.file):
+                _file = self.options.file
+            elif os.path.exists('dict/%s' % self.options.file):
+                _file = 'dict/%s' % self.options.file
+            else:
+                print_msg('[ERROR] Names file not found: %s' % self.options.file)
+                exit(-1)
+
+        normal_lines = []
+        wildcard_lines = []
+        wildcard_list = []
+        regex_list = []
+        lines = set()
+        with open(_file) as f:
+            for line in f.xreadlines():
                 sub = line.strip()
-                if sub: self.queue.put(sub)
+                if not sub or sub in lines:
+                    continue
+                lines.add(sub)
 
-    def _load_next_sub(self):
-        next_subs = []
-        with open('dict/next_sub.txt') as f:
-            for line in f:
-                sub = line.strip()
-                if sub and sub not in next_subs:
-                    next_subs.append(sub)
-        self.next_subs = next_subs
+                if sub.find('{alphnum}') >= 0 or sub.find('{alpha}') >= 0 or sub.find('{num}') >= 0:
+                    wildcard_lines.append(sub)
+                    sub = sub.replace('{alphnum}', '[a-z0-9]')
+                    sub = sub.replace('{alpha}', '[a-z]')
+                    sub = sub.replace('{num}', '[0-9]')
+                    if sub not in wildcard_list:
+                        wildcard_list.append(sub)
+                        regex_list.append('^' + sub + '$')
+                else:
+                    normal_lines.append(sub)
+        if regex_list:
+            pattern = '|'.join(regex_list)
+            _regex = re.compile(pattern)
+            for line in normal_lines[:]:
+                if _regex.search(line):
+                    normal_lines.remove(line)
 
-    def _update_scan_count(self):
-        self.lock.acquire()
-        self.scan_count += 1
-        self.lock.release()
+        for item in normal_lines[self.process_num::self.options.process]:
+            self.priority += 1
+            self.queue.put((self.priority, item))
 
-    def _print_progress(self):
-        self.lock.acquire()
-        msg = '%s found | %s remaining | %s scanned in %.2f seconds' % (
-            self.found_count, self.queue.qsize(), self.scan_count, time.time() - self.start_time)
-        sys.stdout.write('\r' + ' ' * (self.console_width -len(msg)) + msg)
-        sys.stdout.flush()
-        self.lock.release()
+        for item in wildcard_lines[self.process_num::self.options.process]:
+            self.queue.put((88888888, item))
 
-    @staticmethod
-    def is_intranet(ip):
-        ret = ip.split('.')
-        if not len(ret) == 4:
-            return True
-        if ret[0] == '10':
-            return True
-        if ret[0] == '172' and 16 <= int(ret[1]) <= 32:
-            return True
-        if ret[0] == '192' and ret[1] == '168':
-            return True
-        return False
+    def put_item(self, item):
+        num = item.count('{alphnum}') + item.count('{alpha}') + item.count('{num}')
+        if num == 0:
+            self.priority += 1
+            self.queue.put((self.priority, item))
+        else:
+            self.queue.put((self.priority + num * 10000000, item))
 
-    def _scan(self):
-        thread_id = int( threading.currentThread().getName() )
-        self.resolvers[thread_id].nameservers.insert(0, self.dns_servers[thread_id % self.dns_count])
-        self.resolvers[thread_id].lifetime = self.resolvers[thread_id].timeout = 10.0
-        while self.queue.qsize() > 0 and not self.STOP_ME and self.found_count < 40000:    # limit max found records to 40000
-            sub = self.queue.get(timeout=1.0)
-            for _ in range(3):
+    def _scan(self, j):
+        self.resolvers[j].nameservers = [self.dns_servers[j % self.dns_count]]
+        while not self.queue.empty():
+            try:
+                item = self.queue.get(timeout=3.0)[1]
+                self.scan_count_local += 1
+                if time.time() - self.local_time > 3.0:
+                    self.scan_count.value += self.scan_count_local
+                    self.scan_count_local = 0
+                    self.queue_size_list[self.process_num] = self.queue.qsize()
+            except Exception as e:
+                break
+            try:
+                if item.find('{alphnum}') >= 0:
+                    for _letter in 'abcdefghijklmnopqrstuvwxyz0123456789':
+                        self.put_item(item.replace('{alphnum}', _letter, 1))
+                    continue
+                elif item.find('{alpha}') >= 0:
+                    for _letter in 'abcdefghijklmnopqrstuvwxyz':
+                        self.put_item(item.replace('{alpha}', _letter, 1))
+                    continue
+                elif item.find('{num}') >= 0:
+                    for _letter in '0123456789':
+                        self.put_item(item.replace('{num}', _letter, 1))
+                    continue
+                elif item.find('{next_sub}') >= 0:
+                    for _ in self.next_subs:
+                        self.queue.put((0, item.replace('{next_sub}', _, 1)))
+                    continue
+                else:
+                    sub = item
+
+                if sub in self.found_subs:
+                    continue
+
+                cur_sub_domain = sub + '.' + self.target
+                _sub = sub.split('.')[-1]
                 try:
-                    cur_sub_domain = sub + '.' + self.target
-                    answers = d.resolvers[thread_id].query(cur_sub_domain)
-                    is_wildcard_record = False
-                    if answers:
-                        for answer in answers:
-                            self.lock.acquire()
-                            if answer.address not in self.ip_dict:
-                                self.ip_dict[answer.address] = 1
-                            else:
-                                self.ip_dict[answer.address] += 1
-                                if self.ip_dict[answer.address] > 2:    # a wildcard DNS record
-                                    is_wildcard_record = True
-                            self.lock.release()
-                        if is_wildcard_record:
-                            self._update_scan_count()
-                            self._print_progress()
+                    answers = self.resolvers[j].query(cur_sub_domain)
+                except dns.resolver.NoAnswer, e:
+                    answers = self.ex_resolver.query(cur_sub_domain)
+
+                if answers:
+                    self.found_subs.add(sub)
+                    ips = ', '.join(sorted([answer.address for answer in answers]))
+                    if ips in ['1.1.1.1', '127.0.0.1', '0.0.0.0']:
+                        continue
+
+                    if self.options.i and is_intranet(answers[0].address):
+                        continue
+
+                    try:
+                        self.scan_count_local += 1
+                        answers = self.resolvers[j].query(cur_sub_domain, 'cname')
+                        cname = answers[0].target.to_unicode().rstrip('.')
+                        if cname.endswith(self.target) and cname not in self.found_subs:
+                            self.found_subs.add(cname)
+                            cname_sub = cname[:len(cname) - len(self.target) - 1]    # new sub
+                            self.queue.put((0, cname_sub))
+
+                    except:
+                        pass
+
+                    if (_sub, ips) not in self.ip_dict:
+                        self.ip_dict[(_sub, ips)] = 1
+                    else:
+                        self.ip_dict[(_sub, ips)] += 1
+                        if self.ip_dict[(_sub, ips)] > 30:
                             continue
-                        ips = ', '.join([answer.address for answer in answers])
-                        if (not self.ignore_intranet) or (not DNSBrute.is_intranet(answers[0].address)):
-                            self.lock.acquire()
-                            self.found_count += 1
-                            msg = cur_sub_domain.ljust(30) + ips
-                            sys.stdout.write('\r' + msg + ' ' * (self.console_width- len(msg)) + '\n\r')
-                            sys.stdout.flush()
-                            self.outfile.write(cur_sub_domain.ljust(30) + '\t' + ips + '\n')
-                            self.lock.release()
-                            try:
-                                d.resolvers[thread_id].query('*.' + cur_sub_domain)
-                            except:
-                                for i in self.next_subs:
-                                    self.queue.put(i + '.' + sub)
-                        break
-                except dns.resolver.NoNameservers, e:
-                    break
-                except Exception, e:
-                    pass
-            self._update_scan_count()
-            self._print_progress()
-        self._print_progress()
-        self.lock.acquire()
-        self.thread_count -= 1
-        self.lock.release()
+
+                    self.found_count_local += 1
+                    if time.time() - self.local_time > 3.0:
+                        self.found_count.value += self.found_count_local
+                        self.found_count_local = 0
+                        self.queue_size_list[self.process_num] = self.queue.qsize()
+                        self.local_time = time.time()
+
+                    msg = cur_sub_domain.ljust(30) + ips
+                    # print_msg(msg, line_feed=True)
+
+                    self.outfile.write(cur_sub_domain.ljust(30) + '\t' + ips + '\n')
+                    self.outfile.flush()
+                    try:
+                        self.resolvers[j].query('lijiejietest.' + cur_sub_domain)
+                    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as e:
+                        self.queue.put((999999999, '{next_sub}.' + sub))
+                    except:
+                        pass
+
+            except (dns.resolver.NXDOMAIN, dns.name.EmptyLabel) as e:
+                pass
+            except (dns.resolver.NoNameservers, dns.resolver.NoAnswer, dns.exception.Timeout) as e:
+                pass
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                with open('errors.log', 'a') as errFile:
+                    errFile.write('[%s] %s %s\n' % (type(e), cur_sub_domain, str(e)))
 
     def run(self):
-        self.start_time = time.time()
-        for i in range(self.threads_num):
-            t = threading.Thread(target=self._scan, name=str(i))
-            t.setDaemon(True)
-            t.start()
-        while self.thread_count > 1:
-            try:
-                time.sleep(1.0)
-            except KeyboardInterrupt,e:
-                msg = '[WARNING] User aborted, wait all slave threads to exit...'
-                sys.stdout.write('\r' + msg + ' ' * (self.console_width- len(msg)) + '\n\r')
-                sys.stdout.flush()
-                self.STOP_ME = True
+        threads = [gevent.spawn(self._scan, i) for i in range(self.options.threads)]
+        gevent.joinall(threads)
+
+
+def run_process(target, options, process_num, dns_servers, next_subs, scan_count, found_count, queue_size_list,
+                tmp_dir):
+    signal.signal(signal.SIGINT, user_abort)
+    s = SubNameBrute(target=target, options=options, process_num=process_num,
+                     dns_servers=dns_servers, next_subs=next_subs,
+                     scan_count=scan_count, found_count=found_count, queue_size_list=queue_size_list,
+                     tmp_dir=tmp_dir)
+    s.run()
+
 
 if __name__ == '__main__':
-    parser = optparse.OptionParser('usage: %prog [options] target.com')
-    parser.add_option('-t', '--threads', dest='threads_num',
-              default=60, type='int',
-              help='Number of threads. default = 60')
-    parser.add_option('-f', '--file', dest='names_file', default='dict/subnames.txt',
-              type='string', help='Dict file used to brute sub names')
-    parser.add_option('-i', '--ignore-intranet', dest='i', default=False, action='store_true',
-              help='Ignore domains pointed to private IPs')
-    parser.add_option('-o', '--output', dest='output', default=None,
-              type='string', help='Output file name. default is {target}.txt')
+    options, args = parse_args()
+    start_time = time.time()
+    # make tmp dirs
+    tmp_dir = 'tmp/%s_%s' % (args[0], int(time.time()))
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
 
-    (options, args) = parser.parse_args()
-    if len(args) < 1:
-        parser.print_help()
-        sys.exit(0)
+    multiprocessing.freeze_support()
+    all_process = []
+    dns_servers = load_dns_servers()
+    next_subs = load_next_sub(options)
+    scan_count = multiprocessing.Value('i', 0)
+    found_count = multiprocessing.Value('i', 0)
+    queue_size_list = multiprocessing.Array('i', options.process)
 
-    d = DNSBrute(target=args[0], names_file=options.names_file,
-                 ignore_intranet=options.i,
-                 threads_num=options.threads_num,
-                 output=options.output)
-    d.run()
-    while threading.activeCount() > 1:
-        time.sleep(0.1)
+    try:
+        print '[+] Init %s scan process.' % options.process
+        for process_num in range(options.process):
+            p = multiprocessing.Process(target=run_process,
+                                        args=(args[0], options, process_num,
+                                              dns_servers, next_subs,
+                                              scan_count, found_count,queue_size_list,
+                                              tmp_dir)
+                                        )
+            all_process.append(p)
+            p.start()
+
+        while all_process:
+            for p in all_process:
+                if not p.is_alive():
+                    all_process.remove(p)
+            groups_count = 0
+            for c in queue_size_list:
+                groups_count += c
+            msg = '[*] %s found, %s scanned in %.1f seconds, %s groups left' % (
+                found_count.value, scan_count.value, time.time() - start_time, groups_count)
+            print_msg(msg)
+            time.sleep(1.0)
+    except KeyboardInterrupt as e:
+        for p in all_process:
+            p.terminate()
+        print '[ERROR] User aborted the scan!'
+    except Exception as e:
+        print e
+
+    msg = '[+] All Done. %s found, %s scanned in %.1f seconds.' % (
+        found_count.value, scan_count.value, time.time() - start_time)
+    print_msg(msg, line_feed=True)
+    out_file_name = get_out_file_name(args[0], options)
+    with open(out_file_name, 'w') as f:
+        for _file in glob.glob(tmp_dir + '/*.txt'):
+            with open(_file,'r') as tmp_f:
+                content = tmp_f.read()
+            f.write(content)
+    print '[+] The output file is %s' % out_file_name
